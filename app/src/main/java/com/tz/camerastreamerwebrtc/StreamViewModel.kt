@@ -20,11 +20,10 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
 
     private var client: WebRtcClient? = null
 
-    // FIX: EglBase живёт здесь, чтобы переиспользоваться между сессиями.
+    // EglBase живёт здесь, чтобы переиспользоваться между сессиями.
     private val eglBase: EglBase = EglBase.create()
 
-    // FIX: единый рендерер на всё время жизни ViewModel.
-    // Не обнуляем его в stop() — иначе при рестарте превью не появится.
+    // Рендерер живёт, пока жив UI. Не обнуляем в stop().
     private var renderer: SurfaceViewRenderer? = null
     private var rendererInitialized = false
 
@@ -37,7 +36,6 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
     fun attachLocalRenderer(r: SurfaceViewRenderer) {
         renderer = r
 
-        // FIX: инициализируем ровно один раз на жизнь рендерера.
         if (!rendererInitialized) {
             try {
                 r.init(eglBase.eglBaseContext, null)
@@ -48,12 +46,10 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        // Если клиент уже есть — сразу подписываемся.
         client?.attachLocalRenderer(r)
     }
 
     fun detachLocalRenderer(r: SurfaceViewRenderer) {
-        // Вызывается из AndroidView.onRelease при уничтожении композиции.
         try {
             client?.detachLocalRenderer(r)
         } catch (_: Exception) {}
@@ -67,19 +63,20 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
         _status.value = "Error: camera/microphone permission denied"
     }
 
-    fun start(signalingUrl: String) {
-        Log.i(tag, "start() called: $signalingUrl")
+    // NEW: параметр facing — какую камеру использовать.
+    fun start(signalingUrl: String, facing: CameraFacing = CameraFacing.BACK) {
+        Log.i(tag, "start() called: $signalingUrl facing=$facing")
         if (_isStreaming.value) return
         viewModelScope.launch {
             try {
                 _status.value = "Connecting..."
 
-                // FIX: всю тяжёлую инициализацию — на background.
                 val c = withContext(Dispatchers.Default) {
                     WebRtcClient(
                         context = getApplication(),
                         signalingUrl = signalingUrl,
-                        eglBase = eglBase,      // FIX: shared EglBase
+                        eglBase = eglBase,
+                        cameraFacing = facing,
                         onStatus = { s ->
                             Log.i(tag, "Status: $s")
                             _status.value = s
@@ -88,7 +85,6 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 client = c
 
-                // Attach рендерера — на Main.
                 renderer?.let { c.attachLocalRenderer(it) }
 
                 c.start()
@@ -106,7 +102,6 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() {
         try { client?.stop() } catch (e: Exception) { Log.w(tag, "stop: ${e.message}") }
         client = null
-        // FIX: renderer НЕ сбрасываем — он живёт в UI и переиспользуется при рестарте.
         _isStreaming.value = false
         _status.value = "Idle"
     }
@@ -114,7 +109,6 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         stop()
 
-        // Освобождаем рендерер и EglBase только когда ViewModel умирает.
         try {
             renderer?.let { if (rendererInitialized) it.release() }
         } catch (_: Exception) {}

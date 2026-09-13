@@ -19,6 +19,7 @@ import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
+import org.webrtc.RtpParameters
 import org.webrtc.RtpReceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
@@ -32,24 +33,42 @@ import org.webrtc.AudioTrack
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
+/** Какая камера используется для захвата. */
+enum class CameraFacing { FRONT, BACK }
+
 @SuppressLint("MissingPermission")
 class WebRtcClient(
     context: Context,
     private val signalingUrl: String,
-    private val eglBase: EglBase,          // FIX: shared
+    private val eglBase: EglBase,
+    private val cameraFacing: CameraFacing,
     private val onStatus: (String) -> Unit
 ) {
     private companion object {
         const val tag = "WebRtcClient"
-        const val VIDEO_WIDTH = 1280
-        const val VIDEO_HEIGHT = 720
-        const val VIDEO_FPS = 30
+
+        // FIX: 640x480 вместо 1280x720.
+        // Snapdragon 800 (msm8974) не тянет 720p30 с WebRTC overhead'ом —
+        // энкодер дропает кадры, fps падает до 12-16, ICE рвётся.
+        // 480p@24 работает стабильно.
+        const val VIDEO_WIDTH_MAX = 640
+        const val VIDEO_HEIGHT_MAX = 480
+        const val VIDEO_FPS = 24
+
+        // FIX: битрейт пропорционально ниже — для 640x480 достаточно 1.2 Mbps.
+        // Меньше битрейт → меньше нагрузка на Wi-Fi → меньше потерь.
+        const val TARGET_MAX_BITRATE_BPS = 1_200_000
+        const val TARGET_MIN_BITRATE_BPS = 500_000
     }
 
     private val appContext: Context = context.applicationContext
 
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
+        // FIX: увеличенные таймауты — при -70 dBm пакеты ходят медленно.
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
         .build()
 
     private var factory: PeerConnectionFactory? = null
@@ -64,14 +83,12 @@ class WebRtcClient(
     private var ws: WebSocket? = null
     private var localRenderer: SurfaceViewRenderer? = null
 
-    // FIX: атомарный флаг — защита от гонок stop() из WebSocket-потока и Main.
     private val stopped = AtomicBoolean(false)
 
     // ----------------- Public API -----------------
 
     fun attachLocalRenderer(r: SurfaceViewRenderer) {
         localRenderer = r
-        // Рендерер уже инициализирован ViewModel'ью — здесь только подписываемся.
         try {
             localVideoTrack?.addSink(r)
         } catch (e: Exception) {
@@ -95,38 +112,42 @@ class WebRtcClient(
     }
 
     fun stop() {
-        // FIX: атомарный guard.
         if (!stopped.compareAndSet(false, true)) return
 
         try { ws?.close(1000, "bye") } catch (e: Exception) { Log.w(tag, "WS: ${e.message}") }
         ws = null
 
+        // 1. Останавливаем камеру.
         try { videoCapturer?.stopCapture() } catch (e: Exception) { Log.w(tag, "capture: ${e.message}") }
         try { videoCapturer?.dispose() } catch (_: Exception) {}
         videoCapturer = null
 
-        // FIX: НЕ релизим рендерер — им владеет UI (ViewModel/AndroidView).
-        try {
-            localRenderer?.let { r -> localVideoTrack?.removeSink(r) }
-        } catch (_: Exception) {}
+        // 2. Отписываем рендерер.
+        try { localRenderer?.let { r -> localVideoTrack?.removeSink(r) } } catch (_: Exception) {}
 
+        // 3. Закрываем PC (остановит RTP-потоки и encoder).
         try { peerConnection?.close() } catch (_: Exception) {}
         peerConnection = null
 
-        try { surfaceHelper?.dispose() } catch (_: Exception) {}
-        surfaceHelper = null
+        // 4. Dispose источников.
         try { videoSource?.dispose() } catch (_: Exception) {}
         videoSource = null
         try { audioSource?.dispose() } catch (_: Exception) {}
         audioSource = null
+
+        // 5. Треки.
         try { localVideoTrack?.dispose() } catch (_: Exception) {}
         localVideoTrack = null
         try { localAudioTrack?.dispose() } catch (_: Exception) {}
         localAudioTrack = null
+
+        // 6. factory до surfaceHelper.
         try { factory?.dispose() } catch (_: Exception) {}
         factory = null
 
-        // FIX: EglBase и рендерер НЕ трогаем — они переиспользуются.
+        // 7. SurfaceTextureHelper — последним.
+        try { surfaceHelper?.dispose() } catch (_: Exception) {}
+        surfaceHelper = null
 
         onStatus("Stopped")
     }
@@ -169,15 +190,23 @@ class WebRtcClient(
 
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) {}
             override fun onSignalingChange(state: PeerConnection.SignalingState) {}
+
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
                 onStatus("ICE: $state")
+                Log.i(tag, "ICE state: $state")
+
+                // Как только ICE поднялся — настраиваем sender.
+                // По умолчанию Android стартует с 300 kbps.
+                if (state == PeerConnection.IceConnectionState.CONNECTED) {
+                    configureVideoSender()
+                }
+
                 if (state == PeerConnection.IceConnectionState.FAILED) {
                     Log.w(tag, "ICE failed — stopping")
-                    // FIX: при провале ICE сами инициируем чистку.
-                    // WebSocket close() запустит ветку onClosed → onStatus("Stopped").
                     try { ws?.close(1000, "ice-failed") } catch (_: Exception) {}
                 }
             }
+
             override fun onIceConnectionReceivingChange(receiving: Boolean) {}
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {}
             override fun onAddStream(stream: MediaStream) {}
@@ -190,21 +219,32 @@ class WebRtcClient(
 
     private fun startCapture() {
         val enumerator = Camera2Enumerator(appContext)
-        val deviceName = enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
+
+        val preferred = when (cameraFacing) {
+            CameraFacing.FRONT -> enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
+            CameraFacing.BACK -> enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }
+        }
+        val deviceName = preferred
             ?: enumerator.deviceNames.firstOrNull()
             ?: throw IllegalStateException("No camera found")
+
+        Log.i(tag, "Selected camera: $deviceName (facing=$cameraFacing)")
 
         val capturer = enumerator.createCapturer(deviceName, null)
             ?: throw IllegalStateException("Cannot create capturer")
 
         videoCapturer = capturer
+
+        val (w, h) = pickBestFormat(enumerator, deviceName)
+        Log.i(tag, "Selected capture format: ${w}x${h}")
+
         videoSource = factory?.createVideoSource(false)
             ?: throw IllegalStateException("Cannot create video source")
 
         surfaceHelper = SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
 
         capturer.initialize(surfaceHelper, appContext, videoSource!!.capturerObserver)
-        capturer.startCapture(VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS)
+        capturer.startCapture(w, h, VIDEO_FPS)
 
         localVideoTrack = factory?.createVideoTrack("video0", videoSource)
 
@@ -218,8 +258,70 @@ class WebRtcClient(
         peerConnection?.addTrack(localVideoTrack, listOf("stream0"))
         peerConnection?.addTrack(localAudioTrack, listOf("stream0"))
 
-        // FIX: если рендерер уже привязан — сразу навешиваем.
         localRenderer?.let { localVideoTrack?.addSink(it) }
+    }
+
+    private fun pickBestFormat(enumerator: Camera2Enumerator, device: String): Pair<Int, Int> {
+        val formats = enumerator.getSupportedFormats(device)
+        if (formats.isNullOrEmpty()) return 640 to 480
+
+        val target = formats
+            .filter { it.width <= VIDEO_WIDTH_MAX && it.height <= VIDEO_HEIGHT_MAX }
+            .maxByOrNull { it.width * it.height }
+
+        return target?.let { it.width to it.height } ?: (640 to 480)
+    }
+
+    // ----------------- Video Sender Configuration -----------------
+
+    /**
+     * Задаёт явные параметры видео-сендера. Без этого Android использует
+     * дефолтный bitrate 300 kbps и уходит в 180×320.
+     *
+     * BALANCED: компромисс между разрешением и fps — важно для старого
+     * железа (msm8974), которое не тянет 720p30.
+     */
+    private fun configureVideoSender() {
+        val pc = peerConnection ?: return
+        val sender = pc.senders.firstOrNull { it.track()?.kind() == "video" }
+        if (sender == null) {
+            Log.w(tag, "Video sender not found, skip config")
+            return
+        }
+
+        try {
+            val params = sender.parameters
+
+            // FIX: BALANCED вместо MAINTAIN_RESOLUTION.
+            // При нехватке полосы позволяем WebRTC снижать и разрешение, и fps.
+            params.degradationPreference =
+                RtpParameters.DegradationPreference.BALANCED
+
+            params.encodings?.forEach { enc ->
+                enc.maxBitrateBps = TARGET_MAX_BITRATE_BPS
+                enc.minBitrateBps = TARGET_MIN_BITRATE_BPS
+                enc.maxFramerate = VIDEO_FPS
+            }
+
+            val ok = sender.setParameters(params)
+            Log.i(
+                tag,
+                "Video sender configured: ok=$ok " +
+                        "(max=${TARGET_MAX_BITRATE_BPS}, min=${TARGET_MIN_BITRATE_BPS}, " +
+                        "fps=$VIDEO_FPS, balanced)"
+            )
+
+            val now = sender.parameters
+            now.encodings?.forEachIndexed { i, e ->
+                Log.i(
+                    tag,
+                    "  encoding[$i]: max=${e.maxBitrateBps}, " +
+                            "min=${e.minBitrateBps}, fps=${e.maxFramerate}"
+                )
+            }
+        } catch (ex: Exception) {
+            Log.e(tag, "configureVideoSender failed", ex)
+        }
     }
 
     // ----------------- Signaling -----------------
@@ -250,9 +352,10 @@ class WebRtcClient(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.w(tag, "Signaling failure: ${t.message}")
-                // FIX: сообщаем наверх и завершаем сессию — иначе PC «зависнет» подключённым.
-                onStatus("Signaling error: ${t.message}")
+                val desc = t.message?.takeIf { it.isNotBlank() }
+                    ?: t::class.java.simpleName
+                Log.w(tag, "Signaling failure: $desc (response=${response?.code})")
+                onStatus("Signaling error: $desc")
                 try { stop() } catch (_: Exception) {}
             }
 
@@ -262,7 +365,6 @@ class WebRtcClient(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.i(tag, "Signaling closed: $code $reason")
-                // FIX: реагируем и на нормальное закрытие — иначе клиент «висит».
                 try { stop() } catch (_: Exception) {}
             }
         })
@@ -305,7 +407,6 @@ class WebRtcClient(
             }
             override fun onSetFailure(error: String?) {
                 Log.e(tag, "setRemoteDescription(answer) failed: $error")
-                // FIX: раньше это молчало.
                 onStatus("Answer rejected: $error")
             }
         }, sd)

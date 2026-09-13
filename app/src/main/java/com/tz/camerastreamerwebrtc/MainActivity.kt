@@ -9,6 +9,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -53,6 +54,9 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
     val context = LocalContext.current
     var serverUrl by remember { mutableStateOf("ws://192.168.1.172:5000/ws") }
 
+    // NEW: выбор камеры. По умолчанию — задняя.
+    var cameraFacing by remember { mutableStateOf(CameraFacing.BACK) }
+
     val status by vm.status.collectAsState()
     val isStreaming by vm.isStreaming.collectAsState()
 
@@ -64,12 +68,9 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
                 SurfaceViewRenderer(ctx).also { renderer ->
                     renderer.setZOrderMediaOverlay(true)
                     renderer.setZOrderOnTop(false)
-                    // ViewModel сам инициализирует рендерер (init/setMirror) и
-                    // привяжет его к активному клиенту, если тот уже создан.
                     vm.attachLocalRenderer(renderer)
                 }
             },
-            // FIX: обязательно освобождаем рендерер — иначе утечка при уходе с экрана.
             onRelease = { renderer ->
                 vm.detachLocalRenderer(renderer)
                 try { renderer.release() } catch (_: Exception) {}
@@ -121,6 +122,54 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
 
                     Spacer(Modifier.height(12.dp))
 
+                    // NEW: выбор камеры.
+                    Text(
+                        "Camera:",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.DarkGray
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .selectable(
+                                    selected = cameraFacing == CameraFacing.BACK,
+                                    enabled = !isStreaming,
+                                    onClick = { cameraFacing = CameraFacing.BACK }
+                                )
+                                .padding(end = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = cameraFacing == CameraFacing.BACK,
+                                onClick = { cameraFacing = CameraFacing.BACK },
+                                enabled = !isStreaming
+                            )
+                            Text("Back", color = Color.Black)
+                        }
+                        Row(
+                            modifier = Modifier
+                                .selectable(
+                                    selected = cameraFacing == CameraFacing.FRONT,
+                                    enabled = !isStreaming,
+                                    onClick = { cameraFacing = CameraFacing.FRONT }
+                                )
+                                .padding(end = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = cameraFacing == CameraFacing.FRONT,
+                                onClick = { cameraFacing = CameraFacing.FRONT },
+                                enabled = !isStreaming
+                            )
+                            Text("Front", color = Color.Black)
+                        }
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick = {
@@ -131,7 +180,7 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
                                     context, Manifest.permission.RECORD_AUDIO
                                 ) == PackageManager.PERMISSION_GRANTED
 
-                                if (hasCamera && hasMic) vm.start(serverUrl)
+                                if (hasCamera && hasMic) vm.start(serverUrl, cameraFacing)
                                 else vm.reportPermissionError()
                             },
                             enabled = !isStreaming,
