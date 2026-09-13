@@ -30,26 +30,24 @@ import org.webrtc.VideoTrack
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 @SuppressLint("MissingPermission")
 class WebRtcClient(
     context: Context,
     private val signalingUrl: String,
+    private val eglBase: EglBase,          // FIX: shared
     private val onStatus: (String) -> Unit
 ) {
     private companion object {
-        // Согласно Kotlin Conventions, TAG — это константа, но линтер Android
-        // требует lower-case для приватных. Используем @Suppress + camelCase.
         const val tag = "WebRtcClient"
         const val VIDEO_WIDTH = 1280
         const val VIDEO_HEIGHT = 720
         const val VIDEO_FPS = 30
     }
 
-    // Сохраняем ApplicationContext — он не утекает, в отличие от Activity Context
     private val appContext: Context = context.applicationContext
 
-    private val eglBase: EglBase = EglBase.create()
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
@@ -65,25 +63,31 @@ class WebRtcClient(
 
     private var ws: WebSocket? = null
     private var localRenderer: SurfaceViewRenderer? = null
-    private var rendererInitialized = false
-    private var stopped = false
 
-    fun attachLocalRenderer(renderer: SurfaceViewRenderer) {
-        localRenderer = renderer
-        if (!rendererInitialized) {
-            try {
-                renderer.init(eglBase.eglBaseContext, null)
-                renderer.setMirror(true)
-                rendererInitialized = true
-            } catch (e: Exception) {
-                Log.e(tag, "renderer init failed", e)
-            }
+    // FIX: атомарный флаг — защита от гонок stop() из WebSocket-потока и Main.
+    private val stopped = AtomicBoolean(false)
+
+    // ----------------- Public API -----------------
+
+    fun attachLocalRenderer(r: SurfaceViewRenderer) {
+        localRenderer = r
+        // Рендерер уже инициализирован ViewModel'ью — здесь только подписываемся.
+        try {
+            localVideoTrack?.addSink(r)
+        } catch (e: Exception) {
+            Log.e(tag, "attachLocalRenderer: addSink failed", e)
         }
-        localVideoTrack?.addSink(renderer)
+    }
+
+    fun detachLocalRenderer(r: SurfaceViewRenderer) {
+        try {
+            localVideoTrack?.removeSink(r)
+        } catch (_: Exception) {}
+        if (localRenderer === r) localRenderer = null
     }
 
     fun start() {
-        stopped = false
+        stopped.set(false)
         initWebRtc()
         initPeerConnection()
         startCapture()
@@ -91,8 +95,8 @@ class WebRtcClient(
     }
 
     fun stop() {
-        if (stopped) return
-        stopped = true
+        // FIX: атомарный guard.
+        if (!stopped.compareAndSet(false, true)) return
 
         try { ws?.close(1000, "bye") } catch (e: Exception) { Log.w(tag, "WS: ${e.message}") }
         ws = null
@@ -101,6 +105,7 @@ class WebRtcClient(
         try { videoCapturer?.dispose() } catch (_: Exception) {}
         videoCapturer = null
 
+        // FIX: НЕ релизим рендерер — им владеет UI (ViewModel/AndroidView).
         try {
             localRenderer?.let { r -> localVideoTrack?.removeSink(r) }
         } catch (_: Exception) {}
@@ -121,14 +126,12 @@ class WebRtcClient(
         try { factory?.dispose() } catch (_: Exception) {}
         factory = null
 
-        try { if (rendererInitialized) localRenderer?.release() } catch (_: Exception) {}
-        localRenderer = null
-        rendererInitialized = false
-
-        try { eglBase.release() } catch (_: Exception) {}
+        // FIX: EglBase и рендерер НЕ трогаем — они переиспользуются.
 
         onStatus("Stopped")
     }
+
+    // ----------------- Init -----------------
 
     private fun initWebRtc() {
         PeerConnectionFactory.initialize(
@@ -168,6 +171,12 @@ class WebRtcClient(
             override fun onSignalingChange(state: PeerConnection.SignalingState) {}
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
                 onStatus("ICE: $state")
+                if (state == PeerConnection.IceConnectionState.FAILED) {
+                    Log.w(tag, "ICE failed — stopping")
+                    // FIX: при провале ICE сами инициируем чистку.
+                    // WebSocket close() запустит ветку onClosed → onStatus("Stopped").
+                    try { ws?.close(1000, "ice-failed") } catch (_: Exception) {}
+                }
             }
             override fun onIceConnectionReceivingChange(receiving: Boolean) {}
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {}
@@ -209,8 +218,11 @@ class WebRtcClient(
         peerConnection?.addTrack(localVideoTrack, listOf("stream0"))
         peerConnection?.addTrack(localAudioTrack, listOf("stream0"))
 
+        // FIX: если рендерер уже привязан — сразу навешиваем.
         localRenderer?.let { localVideoTrack?.addSink(it) }
     }
+
+    // ----------------- Signaling -----------------
 
     private fun connectSignaling() {
         val request = Request.Builder().url(signalingUrl).build()
@@ -225,21 +237,8 @@ class WebRtcClient(
                 try {
                     val json = JSONObject(text)
                     when (json.optString("type")) {
-                        "answer" -> {
-                            val sdp = SessionDescription(
-                                SessionDescription.Type.ANSWER,
-                                json.getString("sdp")
-                            )
-                            peerConnection?.setRemoteDescription(SimpleSdpObserver(), sdp)
-                        }
-                        "candidate" -> {
-                            val c = IceCandidate(
-                                json.optString("sdpMid"),
-                                json.optInt("sdpMLineIndex"),
-                                json.getString("candidate")
-                            )
-                            peerConnection?.addIceCandidate(c)
-                        }
+                        "answer" -> applyAnswer(json.getString("sdp"))
+                        "candidate" -> addRemoteCandidate(json)
                         "bye" -> {
                             onStatus("Peer disconnected")
                             stop()
@@ -251,7 +250,20 @@ class WebRtcClient(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                Log.w(tag, "Signaling failure: ${t.message}")
+                // FIX: сообщаем наверх и завершаем сессию — иначе PC «зависнет» подключённым.
                 onStatus("Signaling error: ${t.message}")
+                try { stop() } catch (_: Exception) {}
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                Log.i(tag, "Signaling closing: $code $reason")
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                Log.i(tag, "Signaling closed: $code $reason")
+                // FIX: реагируем и на нормальное закрытие — иначе клиент «висит».
+                try { stop() } catch (_: Exception) {}
             }
         })
     }
@@ -274,9 +286,40 @@ class WebRtcClient(
                 }, sdp)
             }
             override fun onSetSuccess() {}
-            override fun onCreateFailure(error: String?) { Log.e(tag, "createOffer: $error") }
-            override fun onSetFailure(error: String?) { Log.e(tag, "setLocal: $error") }
+            override fun onCreateFailure(error: String?) {
+                Log.e(tag, "createOffer: $error")
+                onStatus("Offer error: $error")
+            }
+            override fun onSetFailure(error: String?) {
+                Log.e(tag, "setLocal: $error")
+                onStatus("SetLocal error: $error")
+            }
         }, constraints)
+    }
+
+    private fun applyAnswer(sdp: String) {
+        val sd = SessionDescription(SessionDescription.Type.ANSWER, sdp)
+        peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
+            override fun onSetSuccess() {
+                Log.i(tag, "setRemoteDescription(answer) OK")
+            }
+            override fun onSetFailure(error: String?) {
+                Log.e(tag, "setRemoteDescription(answer) failed: $error")
+                // FIX: раньше это молчало.
+                onStatus("Answer rejected: $error")
+            }
+        }, sd)
+    }
+
+    private fun addRemoteCandidate(json: JSONObject) {
+        val cand = json.optString("candidate")
+        if (cand.isNullOrEmpty()) return
+        val c = IceCandidate(
+            json.optString("sdpMid", "0"),
+            json.optInt("sdpMLineIndex", 0),
+            cand
+        )
+        peerConnection?.addIceCandidate(c)
     }
 
     private open class SimpleSdpObserver : SdpObserver {

@@ -58,20 +58,26 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
 
     Box(modifier = Modifier.fillMaxSize()) {
 
-        // === Видео-превью: SurfaceViewRenderer с настройками Z-порядка ===
+        // === Видео-превью ===
         AndroidView(
             factory = { ctx ->
                 SurfaceViewRenderer(ctx).also { renderer ->
-                    // КРИТИЧНО: эти настройки позволяют Compose-UI быть поверх видео
                     renderer.setZOrderMediaOverlay(true)
                     renderer.setZOrderOnTop(false)
+                    // ViewModel сам инициализирует рендерер (init/setMirror) и
+                    // привяжет его к активному клиенту, если тот уже создан.
                     vm.attachLocalRenderer(renderer)
                 }
+            },
+            // FIX: обязательно освобождаем рендерер — иначе утечка при уходе с экрана.
+            onRelease = { renderer ->
+                vm.detachLocalRenderer(renderer)
+                try { renderer.release() } catch (_: Exception) {}
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // === UI-контролы поверх видео ===
+        // === UI поверх видео ===
         Column(
             modifier = Modifier
                 .fillMaxSize()
