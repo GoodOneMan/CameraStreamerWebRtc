@@ -1,6 +1,8 @@
 package com.tz.camerastreamerwebrtc
 
 import android.app.Application
+import android.content.Intent
+import android.os.Build
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -16,17 +18,27 @@ import org.webrtc.PeerConnectionFactory
 import org.webrtc.SurfaceViewRenderer
 
 class StreamViewModel(app: Application) : AndroidViewModel(app) {
-    private companion object { const val tag = "StreamVM" }
 
-    // Глобальная инициализация WebRTC (выполняется один раз при создании ViewModel)
+    private companion object {
+        const val TAG = "StreamVM"
+        /** Задержка перед попыткой переподключения (мс) */
+        const val RECONNECT_DELAY_MS = 3000L
+    }
+
+    // ── Глобальная инициализация WebRTC ──
+    // Вызывается ОДИН раз при создании ViewModel.
+    // Раньше вызывалась в WebRtcClient.initWebRtc() при каждом start(),
+    // что приводило к нативному крашу при переподключении.
     init {
         try {
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(getApplication())
                     .createInitializationOptions()
             )
+            Log.i(TAG, "PeerConnectionFactory initialized")
         } catch (e: Exception) {
-            Log.w(tag, "PeerConnectionFactory already initialized or init failed: ${e.message}")
+            // Может бросить, если уже инициализирован — это нормально
+            Log.w(TAG, "PeerConnectionFactory init: ${e.message}")
         }
     }
 
@@ -40,11 +52,13 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
     private val _isStreaming = MutableStateFlow(false)
     val isStreaming: StateFlow<Boolean> = _isStreaming
 
-    // --- Параметры для автопереподключения ---
+    // ── Состояние для автопереподключения ──
     private var isUserStopped = false
     private var reconnectJob: Job? = null
     private var lastSignalingUrl = ""
     private var lastCameraFacing = CameraFacing.BACK
+
+    // ── Рендерер ──
 
     fun attachLocalRenderer(r: SurfaceViewRenderer) {
         renderer = r
@@ -54,7 +68,7 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
                 r.setMirror(true)
                 rendererInitialized = true
             } catch (e: Exception) {
-                Log.e(tag, "renderer init failed", e)
+                Log.e(TAG, "renderer init failed", e)
             }
         }
         client?.attachLocalRenderer(r)
@@ -72,14 +86,20 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
         _status.value = "Error: camera/microphone permission denied"
     }
 
+    // ── Старт / стоп ──
+
     fun start(signalingUrl: String, facing: CameraFacing = CameraFacing.BACK) {
         lastSignalingUrl = signalingUrl
         lastCameraFacing = facing
         isUserStopped = false
         reconnectJob?.cancel()
 
-        Log.i(tag, "start() called: $signalingUrl facing=$facing")
+        Log.i(TAG, "start(): $signalingUrl facing=$facing")
         if (_isStreaming.value) return
+
+        // Запускаем foreground-сервис ДО создания WebRTC-клиента,
+        // чтобы система не убила процесс во время установки соединения
+        startStreamingService()
 
         viewModelScope.launch {
             try {
@@ -91,10 +111,10 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
                         eglBase = eglBase,
                         cameraFacing = facing,
                         onStatus = { s ->
-                            Log.i(tag, "Status: $s")
+                            Log.i(TAG, "Status: $s")
                             _status.value = s
                         },
-                        onDisconnect = { handleDisconnect() } // Инжектим колбэк разрыва
+                        onDisconnect = { handleDisconnect() } // ← колбэк разрыва
                     )
                 }
                 client = c
@@ -102,49 +122,78 @@ class StreamViewModel(app: Application) : AndroidViewModel(app) {
                 c.start()
                 _isStreaming.value = true
             } catch (e: Exception) {
-                Log.e(tag, "Start failed", e)
+                Log.e(TAG, "Start failed", e)
                 _status.value = "Error: ${e.message}"
                 _isStreaming.value = false
                 try { client?.stop() } catch (_: Exception) {}
                 client = null
-                handleDisconnect() // Если старт упал, тоже пробуем переподключиться
-            }
-        }
-    }
-
-    private fun handleDisconnect() {
-        if (isUserStopped) return // Если юзер сам нажал Stop, не reconnect'имся
-
-        viewModelScope.launch {
-            _status.value = "Connection lost. Reconnecting in 3s..."
-            reconnectJob?.cancel()
-            reconnectJob = launch {
-                delay(3000)
-                if (!isUserStopped) {
-                    Log.i(tag, "Attempting to reconnect...")
-                    try { client?.stop() } catch (_: Exception) {}
-                    client = null
-                    _isStreaming.value = false
-                    start(lastSignalingUrl, lastCameraFacing)
-                }
+                stopStreamingService()
+                handleDisconnect() // Попробуем переподключиться
             }
         }
     }
 
     fun stop() {
-        isUserStopped = true
+        isUserStopped = true          // ← флаг: пользователь сам остановил
         reconnectJob?.cancel()
-        try { client?.stop() } catch (e: Exception) { Log.w(tag, "stop: ${e.message}") }
+        try { client?.stop() } catch (e: Exception) { Log.w(TAG, "stop: ${e.message}") }
         client = null
         _isStreaming.value = false
         _status.value = "Idle"
+        stopStreamingService()
     }
+
+    // ── Автопереподключение ──
+
+    /**
+     * Вызывается из WebRtcClient при обрыве WebSocket или падении ICE.
+     * Если пользователь сам нажал Stop (isUserStopped == true) — ничего не делаем.
+     */
+    private fun handleDisconnect() {
+        if (isUserStopped) return
+
+        viewModelScope.launch {
+            _status.value = "Connection lost. Reconnecting in ${RECONNECT_DELAY_MS / 1000}s..."
+            reconnectJob?.cancel()
+            reconnectJob = launch {
+                delay(RECONNECT_DELAY_MS)
+                if (!isUserStopped) {
+                    Log.i(TAG, "Attempting reconnect...")
+                    // Чистим старый клиент
+                    try { client?.stop() } catch (_: Exception) {}
+                    client = null
+                    _isStreaming.value = false
+                    // Рекурсивно вызываем start() с теми же параметрами
+                    start(lastSignalingUrl, lastCameraFacing)
+                } else {
+                    stopStreamingService()
+                }
+            }
+        }
+    }
+
+    // ── Foreground-сервис ──
+
+    private fun startStreamingService() {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, StreamingService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ctx.startForegroundService(intent)
+        } else {
+            ctx.startService(intent)
+        }
+    }
+
+    private fun stopStreamingService() {
+        val ctx = getApplication<Application>()
+        ctx.stopService(Intent(ctx, StreamingService::class.java))
+    }
+
+    // ── Очистка ──
 
     override fun onCleared() {
         stop()
-        try {
-            renderer?.let { if (rendererInitialized) it.release() }
-        } catch (_: Exception) {}
+        try { renderer?.let { if (rendererInitialized) it.release() } } catch (_: Exception) {}
         renderer = null
         rendererInitialized = false
         try { eglBase.release() } catch (_: Exception) {}

@@ -13,6 +13,7 @@ import org.webrtc.*
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
+/** Какая камера используется для захвата. */
 enum class CameraFacing { FRONT, BACK }
 
 @SuppressLint("MissingPermission")
@@ -22,7 +23,7 @@ class WebRtcClient(
     private val eglBase: EglBase,
     private val cameraFacing: CameraFacing,
     private val onStatus: (String) -> Unit,
-    private val onDisconnect: () -> Unit // Колбэк для автопереподключения
+    private val onDisconnect: () -> Unit   // ← новый колбэк
 ) {
     private companion object {
         const val tag = "WebRtcClient"
@@ -53,9 +54,13 @@ class WebRtcClient(
     private var localRenderer: SurfaceViewRenderer? = null
     private val stopped = AtomicBoolean(false)
 
+    // ── Public API ──
+
     fun attachLocalRenderer(r: SurfaceViewRenderer) {
         localRenderer = r
-        try { localVideoTrack?.addSink(r) } catch (e: Exception) { Log.e(tag, "attachLocalRenderer failed", e) }
+        try { localVideoTrack?.addSink(r) } catch (e: Exception) {
+            Log.e(tag, "attachLocalRenderer: addSink failed", e)
+        }
     }
 
     fun detachLocalRenderer(r: SurfaceViewRenderer) {
@@ -81,6 +86,7 @@ class WebRtcClient(
         videoCapturer = null
 
         try { localRenderer?.let { r -> localVideoTrack?.removeSink(r) } } catch (_: Exception) {}
+
         try { peerConnection?.close() } catch (_: Exception) {}
         peerConnection = null
 
@@ -102,8 +108,11 @@ class WebRtcClient(
         onStatus("Stopped")
     }
 
+    // ── Инициализация ──
+
     private fun initWebRtc() {
-        // PeerConnectionFactory.initialize перенесен в StreamViewModel.init
+        // PeerConnectionFactory.initialize УБРАН отсюда.
+        // Теперь он вызывается один раз в StreamViewModel.init{}.
 
         val encoderFactory = DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true)
         val decoderFactory = DefaultVideoDecoderFactory(eglBase.eglBaseContext)
@@ -122,7 +131,9 @@ class WebRtcClient(
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
         }
+
         peerConnection = factory?.createPeerConnection(config, object : PeerConnection.Observer {
+
             override fun onIceCandidate(candidate: IceCandidate) {
                 val json = JSONObject().apply {
                     put("type", "candidate")
@@ -132,20 +143,29 @@ class WebRtcClient(
                 }
                 ws?.send(json.toString())
             }
+
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) {}
             override fun onSignalingChange(state: PeerConnection.SignalingState) {}
+
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
                 onStatus("ICE: $state")
                 Log.i(tag, "ICE state: $state")
+
                 if (state == PeerConnection.IceConnectionState.CONNECTED) {
                     configureVideoSender()
                 }
-                // Триггерим переподключение при разрыве или падении ICE
-                if (state == PeerConnection.IceConnectionState.FAILED || state == PeerConnection.IceConnectionState.DISCONNECTED) {
+
+                // При FAILED или DISCONNECTED — сигнализируем ViewModel о разрыве.
+                // DISCONNECTED важен: при Doze-режиме ICE часто переходит сначала
+                // в DISCONNECTED, и только через 30 сек — в FAILED.
+                if (state == PeerConnection.IceConnectionState.FAILED ||
+                    state == PeerConnection.IceConnectionState.DISCONNECTED
+                ) {
                     Log.w(tag, "ICE $state — triggering reconnect")
                     if (!stopped.get()) onDisconnect()
                 }
             }
+
             override fun onIceConnectionReceivingChange(receiving: Boolean) {}
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {}
             override fun onAddStream(stream: MediaStream) {}
@@ -153,6 +173,7 @@ class WebRtcClient(
             override fun onDataChannel(channel: DataChannel) {}
             override fun onRenegotiationNeeded() {}
             override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {}
+
         }) ?: throw IllegalStateException("PeerConnection creation failed")
     }
 
@@ -160,17 +181,22 @@ class WebRtcClient(
         val enumerator = Camera2Enumerator(appContext)
         val preferred = when (cameraFacing) {
             CameraFacing.FRONT -> enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
-            CameraFacing.BACK -> enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }
+            CameraFacing.BACK  -> enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }
         }
-        val deviceName = preferred ?: enumerator.deviceNames.firstOrNull()
-        ?: throw IllegalStateException("No camera found")
+        val deviceName = preferred
+            ?: enumerator.deviceNames.firstOrNull()
+            ?: throw IllegalStateException("No camera found")
 
+        Log.i(tag, "Selected camera: $deviceName (facing=$cameraFacing)")
         val capturer = enumerator.createCapturer(deviceName, null)
             ?: throw IllegalStateException("Cannot create capturer")
         videoCapturer = capturer
 
         val (w, h) = pickBestFormat(enumerator, deviceName)
-        videoSource = factory?.createVideoSource(false) ?: throw IllegalStateException("Cannot create video source")
+        Log.i(tag, "Selected capture format: ${w}x${h}")
+
+        videoSource = factory?.createVideoSource(false)
+            ?: throw IllegalStateException("Cannot create video source")
         surfaceHelper = SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
         capturer.initialize(surfaceHelper, appContext, videoSource!!.capturerObserver)
         capturer.startCapture(w, h, VIDEO_FPS)
@@ -198,9 +224,15 @@ class WebRtcClient(
         return target?.let { it.width to it.height } ?: (640 to 480)
     }
 
+    // ── Настройка видео-сендера ──
+
     private fun configureVideoSender() {
         val pc = peerConnection ?: return
-        val sender = pc.senders.firstOrNull { it.track()?.kind() == "video" } ?: return
+        val sender = pc.senders.firstOrNull { it.track()?.kind() == "video" }
+        if (sender == null) {
+            Log.w(tag, "Video sender not found, skip config")
+            return
+        }
         try {
             val params = sender.parameters
             params.degradationPreference = RtpParameters.DegradationPreference.BALANCED
@@ -209,38 +241,62 @@ class WebRtcClient(
                 enc.minBitrateBps = TARGET_MIN_BITRATE_BPS
                 enc.maxFramerate = VIDEO_FPS
             }
-            sender.setParameters(params)
+            val ok = sender.setParameters(params)
+            Log.i(tag, "Video sender configured: ok=$ok " +
+                    "(max=$TARGET_MAX_BITRATE_BPS, min=$TARGET_MIN_BITRATE_BPS, " +
+                    "fps=$VIDEO_FPS, balanced)")
         } catch (ex: Exception) {
             Log.e(tag, "configureVideoSender failed", ex)
         }
     }
 
+    // ── Сигнализация (WebSocket) ──
+
     private fun connectSignaling() {
         val request = Request.Builder().url(signalingUrl).build()
         ws = httpClient.newWebSocket(request, object : WebSocketListener() {
+
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 onStatus("Signaling connected")
                 createOffer()
             }
+
             override fun onMessage(webSocket: WebSocket, text: String) {
+                Log.d(tag, ">> $text")
                 try {
                     val json = JSONObject(text)
                     when (json.optString("type")) {
-                        "answer" -> applyAnswer(json.getString("sdp"))
+                        "answer"    -> applyAnswer(json.getString("sdp"))
                         "candidate" -> addRemoteCandidate(json)
-                        "bye" -> { onStatus("Peer disconnected"); stop() }
+                        "bye"       -> {
+                            onStatus("Peer disconnected")
+                            stop()
+                        }
                     }
-                } catch (ex: Exception) { Log.e(tag, "onMessage failed", ex) }
+                } catch (ex: Exception) {
+                    Log.e(tag, "onMessage failed", ex)
+                }
             }
+
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.w(tag, "Signaling failure: ${t.message}")
-                onStatus("Signaling error")
-                if (!stopped.get()) onDisconnect() // Триггерим переподключение
+                val desc = t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
+                Log.w(tag, "Signaling failure: $desc (response=${response?.code})")
+                onStatus("Signaling error: $desc")
+                // Не вызываем stop() напрямую — даём ViewModel решить,
+                // переподключаться или нет.
+                if (!stopped.get()) onDisconnect()
             }
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {}
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                Log.i(tag, "Signaling closing: $code $reason")
+            }
+
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                Log.i(tag, "Signaling closed: $code $reason")
+                // 1000 = нормальное закрытие (мы сами вызвали close).
+                // Любой другой код — нештатный разрыв → переподключение.
                 if (!stopped.get() && code != 1000) {
-                    onDisconnect() // Триггерим переподключение при нештатном закрытии
+                    onDisconnect()
                 }
             }
         })
@@ -263,31 +319,46 @@ class WebRtcClient(
                     }
                 }, sdp)
             }
-            override fun onCreateFailure(error: String?) { onStatus("Offer error: $error") }
-            override fun onSetFailure(error: String?) { onStatus("SetLocal error: $error") }
             override fun onSetSuccess() {}
+            override fun onCreateFailure(error: String?) {
+                Log.e(tag, "createOffer: $error")
+                onStatus("Offer error: $error")
+            }
+            override fun onSetFailure(error: String?) {
+                Log.e(tag, "setLocal: $error")
+                onStatus("SetLocal error: $error")
+            }
         }, constraints)
     }
 
     private fun applyAnswer(sdp: String) {
         val sd = SessionDescription(SessionDescription.Type.ANSWER, sdp)
         peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
-            override fun onSetFailure(error: String?) { onStatus("Answer rejected: $error") }
-            override fun onSetSuccess() {}
+            override fun onSetSuccess() {
+                Log.i(tag, "setRemoteDescription(answer) OK")
+            }
+            override fun onSetFailure(error: String?) {
+                Log.e(tag, "setRemoteDescription(answer) failed: $error")
+                onStatus("Answer rejected: $error")
+            }
         }, sd)
     }
 
     private fun addRemoteCandidate(json: JSONObject) {
         val cand = json.optString("candidate")
         if (cand.isNullOrEmpty()) return
-        val c = IceCandidate(json.optString("sdpMid", "0"), json.optInt("sdpMLineIndex", 0), cand)
+        val c = IceCandidate(
+            json.optString("sdpMid", "0"),
+            json.optInt("sdpMLineIndex", 0),
+            cand
+        )
         peerConnection?.addIceCandidate(c)
     }
 
     private open class SimpleSdpObserver : SdpObserver {
         override fun onCreateSuccess(sdp: SessionDescription?) {}
         override fun onSetSuccess() {}
-        override fun onCreateFailure(error: String?) {}
-        override fun onSetFailure(error: String?) {}
+        override fun onCreateFailure(error: String?) { Log.e(tag, "create: $error") }
+        override fun onSetFailure(error: String?) { Log.e(tag, "set: $error") }
     }
 }

@@ -2,6 +2,7 @@ package com.tz.camerastreamerwebrtc
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -27,14 +28,20 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* проверка перед стартом */ }
+    ) { /* проверка перед стартом — см. кнопку Start */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        permissionLauncher.launch(arrayOf(
+
+        // Запрашиваем камеру, микрофон и (на Android 13+) уведомления
+        val permissions = mutableListOf(
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO
-        ))
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        permissionLauncher.launch(permissions.toTypedArray())
 
         setContent {
             MaterialTheme {
@@ -53,15 +60,11 @@ class MainActivity : ComponentActivity() {
 fun StreamScreen(vm: StreamViewModel = viewModel()) {
     val context = LocalContext.current
     var serverUrl by remember { mutableStateOf("ws://192.168.1.172:5000/ws") }
-
-    // NEW: выбор камеры. По умолчанию — задняя.
     var cameraFacing by remember { mutableStateOf(CameraFacing.BACK) }
-
     val status by vm.status.collectAsState()
     val isStreaming by vm.isStreaming.collectAsState()
 
     Box(modifier = Modifier.fillMaxSize()) {
-
         // === Видео-превью ===
         AndroidView(
             factory = { ctx ->
@@ -100,7 +103,6 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
                         style = MaterialTheme.typography.headlineSmall,
                         color = Color.Black
                     )
-
                     Spacer(Modifier.height(12.dp))
 
                     Text(
@@ -108,7 +110,6 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
                         style = MaterialTheme.typography.labelMedium,
                         color = Color.DarkGray
                     )
-
                     BasicTextField(
                         value = serverUrl,
                         onValueChange = { serverUrl = it },
@@ -119,10 +120,9 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
                             .border(1.dp, Color.Gray)
                             .padding(8.dp)
                     )
-
                     Spacer(Modifier.height(12.dp))
 
-                    // NEW: выбор камеры.
+                    // Выбор камеры
                     Text(
                         "Camera:",
                         style = MaterialTheme.typography.labelMedium,
@@ -167,7 +167,6 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
                             Text("Front", color = Color.Black)
                         }
                     }
-
                     Spacer(Modifier.height(12.dp))
 
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -179,7 +178,6 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
                                 val hasMic = ContextCompat.checkSelfPermission(
                                     context, Manifest.permission.RECORD_AUDIO
                                 ) == PackageManager.PERMISSION_GRANTED
-
                                 if (hasCamera && hasMic) vm.start(serverUrl, cameraFacing)
                                 else vm.reportPermissionError()
                             },
@@ -189,7 +187,6 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
                                 contentColor = Color.White
                             )
                         ) { Text("Start") }
-
                         Button(
                             onClick = { vm.stop() },
                             enabled = isStreaming,
@@ -199,7 +196,6 @@ fun StreamScreen(vm: StreamViewModel = viewModel()) {
                             )
                         ) { Text("Stop") }
                     }
-
                     Spacer(Modifier.height(8.dp))
 
                     Text(
